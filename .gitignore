@@ -1,0 +1,6 @@
+build/
+VolumeBar.exe
+*.o
+*.res
+*.pdb
+volume.pdf

@@ -1,0 +1,8 @@
+#include "src/resource.h"
+
+#ifndef RT_MANIFEST
+#define RT_MANIFEST 24
+#endif
+
+IDI_APP_ICON ICON "assets/volumebar.ico"
+1 RT_MANIFEST "app.manifest"
