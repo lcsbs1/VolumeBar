@@ -1,6 +1,7 @@
 #pragma once
 
 #include <windows.h>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -14,6 +15,7 @@
 class TaskbarWidget {
 public:
     static constexpr wchar_t kWindowClass[] = L"VolumeBar_TaskbarWidget";
+    static constexpr wchar_t kBarWindowClass[] = L"VolumeBar_TaskbarBar";
 
     TaskbarWidget(AudioEngine& engine, ConfigManager& config, AppIconCache& icons, MixerPanel& panel);
     ~TaskbarWidget();
@@ -43,25 +45,50 @@ private:
         RECT rect{};
     };
 
+    struct BarInstance {
+        TaskbarWidget* owner = nullptr;
+        HWND hwnd = nullptr;
+        HWND tooltipHwnd = nullptr;
+        HWND trayHwnd = nullptr;
+        HMONITOR monitor = nullptr;
+        bool isPrimary = false;
+        UINT dpi = 96;
+        bool barVisible = false;
+        bool trackingMouse = false;
+        int hoveredSlot = -1;
+        RECT barRect{};
+        std::vector<Slot> slots;
+    };
+
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK BarWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK TooltipWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
     static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
                                       LONG idObject, LONG idChild, DWORD thread, DWORD time);
 
     LRESULT HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam);
+    LRESULT HandleBarMessage(BarInstance& bar, UINT msg, WPARAM wParam, LPARAM lParam);
 
-    bool QueryTaskbarRect(RECT* outRect, bool* outHidden) const;
-    bool IsFullscreenAppActive() const;
+    void SyncTaskbars();
+    std::unique_ptr<BarInstance> CreateBar(HWND trayHwnd, bool isPrimary);
+    void DestroyBar(BarInstance& bar);
+
+    bool QueryTaskbarRect(const BarInstance& bar, RECT* outRect, bool* outHidden) const;
+    bool IsFullscreenAppActive(HMONITOR trayMon) const;
     void CheckVisibilityAndZOrder();
+    void UpdateBarLayoutAndPosition(BarInstance& bar);
 
-    void BuildSlots();
-    void Render();
-    int HitTestSlot(POINT pt) const;
+    RECT GetAnchorRectForBar(const BarInstance& bar) const;
+    BarInstance* FindBarForMonitor(HMONITOR mon) const;
 
-    void ShowTooltipForSlot(int slotIdx, bool autoHideAfterScroll);
-    void ShowTooltipText(const std::wstring& text, POINT anchorScreenPt, bool autoHide);
-    void HideTooltip();
-    void RenderTooltip(const std::wstring& text, POINT anchorScreenPt);
+    void BuildSlots(BarInstance& bar);
+    void RenderBar(BarInstance& bar);
+    int HitTestSlot(const BarInstance& bar, POINT pt) const;
+
+    void ShowTooltipForSlot(BarInstance& bar, int slotIdx, bool autoHideAfterScroll);
+    void ShowTooltipText(BarInstance& bar, const std::wstring& text, POINT anchorScreenPt, bool autoHide);
+    void HideTooltip(BarInstance& bar);
+    void RenderTooltip(BarInstance& bar, const std::wstring& text, POINT anchorScreenPt);
 
     MenuCallbacks MakeMenuCallbacks();
     void OnShellEvent();
@@ -71,9 +98,8 @@ private:
     AppIconCache& icons_;
     MixerPanel& panel_;
 
+    HINSTANCE hInst_ = nullptr;
     HWND hwnd_ = nullptr;
-    HWND tooltipHwnd_ = nullptr;
-    UINT dpi_ = 96;
     UINT taskbarCreatedMsg_ = 0;
     ui::Palette palette_;
 
@@ -81,13 +107,9 @@ private:
     HWINEVENTHOOK hookReorder_ = nullptr;
     HWINEVENTHOOK hookMinimize_ = nullptr;
 
-    bool barVisible_ = false;
-    bool trackingMouse_ = false;
-    int hoveredSlot_ = -1;
-    RECT barRect_{};
+    std::vector<std::unique_ptr<BarInstance>> bars_;
 
     MasterAudioInfo master_;
     std::vector<AppAudioInfo> apps_;
-    std::vector<Slot> slots_;
     std::vector<std::wstring> hotkeyProfileNames_;
 };

@@ -19,6 +19,25 @@ inline bool PtInRc(const RECT& r, POINT p) {
     return p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom;
 }
 
+UINT QueryMonitorDpi(HMONITOR mon, UINT fallback) {
+    if (!mon) return fallback;
+    using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+    HMODULE shcore = GetModuleHandleW(L"Shcore.dll");
+    if (!shcore) shcore = LoadLibraryW(L"Shcore.dll");
+    if (shcore) {
+        auto fn = reinterpret_cast<GetDpiForMonitorFn>(GetProcAddress(shcore, "GetDpiForMonitor"));
+        if (fn) {
+            UINT dpiX = 0;
+            UINT dpiY = 0;
+            // MDT_EFFECTIVE_DPI = 0
+            if (SUCCEEDED(fn(mon, 0, &dpiX, &dpiY)) && dpiX > 0) {
+                return dpiX;
+            }
+        }
+    }
+    return fallback;
+}
+
 } // namespace
 
 MixerPanel::MixerPanel(AudioEngine& engine, ConfigManager& config, AppIconCache& icons)
@@ -127,6 +146,15 @@ void MixerPanel::RefreshData() {
 void MixerPanel::RecomputeSizeAndPosition() {
     if (!hwnd_) return;
 
+    POINT refPt = {lastAnchor_.left, lastAnchor_.top};
+    HMONITOR mon = MonitorFromPoint(refPt, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(mon, &mi);
+
+    UINT monDpi = QueryMonitorDpi(mon, dpi_);
+    if (monDpi != 0) dpi_ = monDpi;
+
     auto sc = [this](int dip) { return ui::ScaleDpi(dip, dpi_); };
 
     int panelW = sc(388);
@@ -146,12 +174,6 @@ void MixerPanel::RecomputeSizeAndPosition() {
     int visibleListH = panelH - listTopY_ - bottomPad;
     int maxScroll = (std::max)(0, contentHeight_ - visibleListH);
     scrollY_ = (std::max)(0, (std::min)(scrollY_, maxScroll));
-
-    POINT refPt = {lastAnchor_.left, lastAnchor_.top};
-    HMONITOR mon = MonitorFromPoint(refPt, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof(mi);
-    GetMonitorInfoW(mon, &mi);
 
     int gap = sc(10);
     int x = lastAnchor_.left;

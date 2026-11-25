@@ -15,6 +15,7 @@ struct VolumeProfile {
 struct AppConfig {
     int maxWidth = 360;
     int scrollStep = 2;
+    bool showOnAllMonitors = true;
     std::wstring openPanelHotkey = L"Ctrl+Alt+V";
     std::map<std::wstring, VolumeProfile> profiles;
 };

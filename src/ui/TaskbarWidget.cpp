@@ -4,6 +4,7 @@
 #include <windowsx.h>
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include "resource.h"
 #include "util/Messages.h"
@@ -34,7 +35,24 @@ bool IsIgnoredFullscreenClass(HWND hwnd) {
            lstrcmpiW(cls, L"Shell_SecondaryTrayWnd") == 0 ||
            lstrcmpiW(cls, L"TaskListThumbnailWnd") == 0 ||
            lstrcmpiW(cls, L"Windows.UI.Core.CoreWindow") == 0 ||
-           lstrcmpiW(cls, TaskbarWidget::kWindowClass) == 0;
+           lstrcmpiW(cls, TaskbarWidget::kWindowClass) == 0 ||
+           lstrcmpiW(cls, TaskbarWidget::kBarWindowClass) == 0;
+}
+
+struct EnumTrayTarget {
+    HWND hwnd = nullptr;
+    bool isPrimary = false;
+};
+
+BOOL CALLBACK EnumSecondaryTraysProc(HWND hwnd, LPARAM lParam) {
+    auto* targets = reinterpret_cast<std::vector<EnumTrayTarget>*>(lParam);
+    wchar_t cls[64]{};
+    if (GetClassNameW(hwnd, cls, static_cast<int>(sizeof(cls) / sizeof(wchar_t))) > 0) {
+        if (lstrcmpiW(cls, L"Shell_SecondaryTrayWnd") == 0 && IsWindowVisible(hwnd)) {
+            targets->push_back({hwnd, false});
+        }
+    }
+    return TRUE;
 }
 
 } // namespace
@@ -49,6 +67,7 @@ TaskbarWidget::~TaskbarWidget() {
 }
 
 bool TaskbarWidget::Create(HINSTANCE hInst) {
+    hInst_ = hInst;
     taskbarCreatedMsg_ = RegisterWindowMessageW(L"TaskbarCreated");
 
     WNDCLASSEXW wc{};
@@ -56,9 +75,17 @@ bool TaskbarWidget::Create(HINSTANCE hInst) {
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
     wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP_ICON));
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = kWindowClass;
     RegisterClassExW(&wc);
+
+    WNDCLASSEXW bwc{};
+    bwc.cbSize = sizeof(bwc);
+    bwc.lpfnWndProc = BarWndProc;
+    bwc.hInstance = hInst;
+    bwc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APP_ICON));
+    bwc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    bwc.lpszClassName = kBarWindowClass;
+    RegisterClassExW(&bwc);
 
     WNDCLASSEXW twc{};
     twc.cbSize = sizeof(twc);
@@ -67,23 +94,14 @@ bool TaskbarWidget::Create(HINSTANCE hInst) {
     twc.lpszClassName = kTooltipClass;
     RegisterClassExW(&twc);
 
+    // Hidden coordinator window: permanent target for audio callbacks, hotkeys, and single-instance toggle.
     hwnd_ = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+        WS_EX_TOOLWINDOW,
         kWindowClass, L"VolumeBar",
         WS_POPUP,
-        0, 0, 100, 40,
+        0, 0, 0, 0,
         nullptr, nullptr, hInst, this);
     if (!hwnd_) return false;
-
-    tooltipHwnd_ = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
-        kTooltipClass, L"",
-        WS_POPUP,
-        0, 0, 10, 10,
-        nullptr, nullptr, hInst, nullptr);
-
-    dpi_ = GetDpiForWindow(hwnd_);
-    if (dpi_ == 0) dpi_ = 96;
 
     panel_.SetCallbacks(MakeMenuCallbacks());
 
@@ -99,6 +117,7 @@ bool TaskbarWidget::Create(HINSTANCE hInst) {
                                     WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     RegisterHotkeys();
+    SyncTaskbars();
     return true;
 }
 
@@ -110,17 +129,104 @@ void TaskbarWidget::Destroy() {
 
     UnregisterHotkeys();
 
-    if (tooltipHwnd_) {
-        DestroyWindow(tooltipHwnd_);
-        tooltipHwnd_ = nullptr;
+    for (auto& bar : bars_) {
+        if (bar) DestroyBar(*bar);
     }
+    bars_.clear();
+
     if (hwnd_) {
         KillTimer(hwnd_, kDirtyDebounceTimerId);
-        KillTimer(hwnd_, kTooltipHideTimerId);
         DestroyWindow(hwnd_);
         hwnd_ = nullptr;
     }
-    barVisible_ = false;
+}
+
+std::unique_ptr<TaskbarWidget::BarInstance> TaskbarWidget::CreateBar(HWND trayHwnd, bool isPrimary) {
+    auto bar = std::make_unique<BarInstance>();
+    bar->owner = this;
+    bar->trayHwnd = trayHwnd;
+    bar->isPrimary = isPrimary;
+    bar->monitor = MonitorFromWindow(trayHwnd, MONITOR_DEFAULTTONEAREST);
+
+    UINT trayDpi = GetDpiForWindow(trayHwnd);
+    bar->dpi = (trayDpi != 0) ? trayDpi : 96;
+
+    bar->hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED,
+        kBarWindowClass, L"VolumeBar",
+        WS_POPUP,
+        0, 0, 100, 40,
+        nullptr, nullptr, hInst_, bar.get());
+    if (!bar->hwnd) return nullptr;
+
+    bar->tooltipHwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+        kTooltipClass, L"",
+        WS_POPUP,
+        0, 0, 10, 10,
+        nullptr, nullptr, hInst_, nullptr);
+
+    return bar;
+}
+
+void TaskbarWidget::DestroyBar(BarInstance& bar) {
+    if (bar.tooltipHwnd) {
+        DestroyWindow(bar.tooltipHwnd);
+        bar.tooltipHwnd = nullptr;
+    }
+    if (bar.hwnd) {
+        KillTimer(bar.hwnd, kTooltipHideTimerId);
+        DestroyWindow(bar.hwnd);
+        bar.hwnd = nullptr;
+    }
+    bar.barVisible = false;
+}
+
+void TaskbarWidget::SyncTaskbars() {
+    if (!hwnd_) return;
+
+    std::vector<EnumTrayTarget> targets;
+    if (HWND primary = FindWindowW(L"Shell_TrayWnd", nullptr)) {
+        targets.push_back({primary, true});
+    }
+    if (config_.Data().showOnAllMonitors) {
+        EnumWindows(EnumSecondaryTraysProc, reinterpret_cast<LPARAM>(&targets));
+    }
+
+    // Remove bars whose taskbar window is gone or no longer enabled.
+    bars_.erase(
+        std::remove_if(bars_.begin(), bars_.end(), [&](const std::unique_ptr<BarInstance>& bar) {
+            if (!bar) return true;
+            bool keep = false;
+            for (const auto& t : targets) {
+                if (t.hwnd == bar->trayHwnd && t.isPrimary == bar->isPrimary) {
+                    keep = true;
+                    break;
+                }
+            }
+            if (!keep) {
+                DestroyBar(*bar);
+                return true;
+            }
+            return false;
+        }),
+        bars_.end());
+
+    // Add bars for newly discovered taskbars.
+    for (const auto& t : targets) {
+        bool exists = false;
+        for (const auto& bar : bars_) {
+            if (bar && bar->trayHwnd == t.hwnd) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            if (auto created = CreateBar(t.hwnd, t.isPrimary)) {
+                bars_.push_back(std::move(created));
+            }
+        }
+    }
 }
 
 void TaskbarWidget::RegisterHotkeys() {
@@ -173,42 +279,94 @@ MenuCallbacks TaskbarWidget::MakeMenuCallbacks() {
     return cb;
 }
 
-RECT TaskbarWidget::GetAnchorRect() const {
-    if (barVisible_ && (barRect_.right > barRect_.left)) {
-        return barRect_;
+TaskbarWidget::BarInstance* TaskbarWidget::FindBarForMonitor(HMONITOR mon) const {
+    for (const auto& bar : bars_) {
+        if (bar && bar->monitor == mon && bar->barVisible) {
+            return bar.get();
+        }
+    }
+    for (const auto& bar : bars_) {
+        if (bar && bar->monitor == mon) {
+            return bar.get();
+        }
+    }
+    return nullptr;
+}
+
+RECT TaskbarWidget::GetAnchorRectForBar(const BarInstance& bar) const {
+    if (bar.barVisible && (bar.barRect.right > bar.barRect.left)) {
+        return bar.barRect;
     }
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
-    HMONITOR mon = MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    HMONITOR mon = bar.monitor ? bar.monitor : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
     if (GetMonitorInfoW(mon, &mi)) {
         return {mi.rcWork.left + 8, mi.rcWork.bottom, mi.rcWork.left + 200, mi.rcWork.bottom + 48};
     }
     return {8, 1032, 200, 1080};
 }
 
-bool TaskbarWidget::QueryTaskbarRect(RECT* outRect, bool* outHidden) const {
+RECT TaskbarWidget::GetAnchorRect() const {
+    POINT cursor{};
+    HMONITOR cursorMon = nullptr;
+    if (GetCursorPos(&cursor)) {
+        cursorMon = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        if (BarInstance* bar = FindBarForMonitor(cursorMon)) {
+            if (bar->barVisible && (bar->barRect.right > bar->barRect.left)) {
+                return bar->barRect;
+            }
+        }
+    }
+
+    for (const auto& bar : bars_) {
+        if (bar && bar->isPrimary && bar->barVisible && (bar->barRect.right > bar->barRect.left)) {
+            return bar->barRect;
+        }
+    }
+    for (const auto& bar : bars_) {
+        if (bar && bar->barVisible && (bar->barRect.right > bar->barRect.left)) {
+            return bar->barRect;
+        }
+    }
+
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    HMONITOR mon = cursorMon ? cursorMon : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    if (GetMonitorInfoW(mon, &mi)) {
+        return {mi.rcWork.left + 8, mi.rcWork.bottom, mi.rcWork.left + 200, mi.rcWork.bottom + 48};
+    }
+    return {8, 1032, 200, 1080};
+}
+
+bool TaskbarWidget::QueryTaskbarRect(const BarInstance& bar, RECT* outRect, bool* outHidden) const {
     if (!outRect || !outHidden) return false;
     *outHidden = false;
 
-    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (!tray) {
+    if (!bar.trayHwnd || !IsWindow(bar.trayHwnd) || !IsWindowVisible(bar.trayHwnd)) {
         *outHidden = true;
         return false;
     }
 
     APPBARDATA abd{};
     abd.cbSize = sizeof(abd);
-    abd.hWnd = tray;
-
-    UINT_PTR state = SHAppBarMessage(ABM_GETSTATE, &abd);
+    abd.hWnd = FindWindowW(L"Shell_TrayWnd", nullptr);
+    UINT_PTR state = abd.hWnd ? SHAppBarMessage(ABM_GETSTATE, &abd) : 0;
     bool autoHide = (state & ABS_AUTOHIDE) != 0;
 
     RECT rc{};
-    if (SHAppBarMessage(ABM_GETTASKBARPOS, &abd) != 0) {
-        rc = abd.rc;
-    } else if (!GetWindowRect(tray, &rc)) {
-        *outHidden = true;
-        return false;
+    if (bar.isPrimary) {
+        abd.hWnd = bar.trayHwnd;
+        if (SHAppBarMessage(ABM_GETTASKBARPOS, &abd) != 0) {
+            rc = abd.rc;
+        } else if (!GetWindowRect(bar.trayHwnd, &rc)) {
+            *outHidden = true;
+            return false;
+        }
+    } else {
+        if (!GetWindowRect(bar.trayHwnd, &rc)) {
+            *outHidden = true;
+            return false;
+        }
     }
 
     if (rc.right <= rc.left || rc.bottom <= rc.top) {
@@ -218,13 +376,14 @@ bool TaskbarWidget::QueryTaskbarRect(RECT* outRect, bool* outHidden) const {
 
     if (autoHide) {
         RECT trayRc{};
-        if (GetWindowRect(tray, &trayRc)) {
-            HMONITOR mon = MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST);
+        if (GetWindowRect(bar.trayHwnd, &trayRc)) {
+            HMONITOR mon = MonitorFromWindow(bar.trayHwnd, MONITOR_DEFAULTTONEAREST);
             MONITORINFO mi{};
             mi.cbSize = sizeof(mi);
             if (GetMonitorInfoW(mon, &mi)) {
                 int visH = (std::min)(trayRc.bottom, mi.rcMonitor.bottom) - (std::max)(trayRc.top, mi.rcMonitor.top);
-                if (visH < 12) {
+                int visW = (std::min)(trayRc.right, mi.rcMonitor.right) - (std::max)(trayRc.left, mi.rcMonitor.left);
+                if (visH < 12 || visW < 12) {
                     *outHidden = true;
                     return false;
                 }
@@ -237,7 +396,15 @@ bool TaskbarWidget::QueryTaskbarRect(RECT* outRect, bool* outHidden) const {
     return true;
 }
 
-bool TaskbarWidget::IsFullscreenAppActive() const {
+bool TaskbarWidget::IsFullscreenAppActive(HMONITOR trayMon) const {
+    if (!trayMon) return false;
+
+    HWND fg = GetForegroundWindow();
+    if (!fg || IsIgnoredFullscreenClass(fg)) return false;
+
+    HMONITOR fgMon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
+    if (fgMon != trayMon) return false;
+
     QUERY_USER_NOTIFICATION_STATE quns = QUNS_ACCEPTS_NOTIFICATIONS;
     if (SUCCEEDED(SHQueryUserNotificationState(&quns))) {
         if (quns == QUNS_RUNNING_D3D_FULL_SCREEN ||
@@ -246,16 +413,6 @@ bool TaskbarWidget::IsFullscreenAppActive() const {
             return true;
         }
     }
-
-    HWND fg = GetForegroundWindow();
-    if (!fg || IsIgnoredFullscreenClass(fg)) return false;
-
-    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (!tray) return false;
-
-    HMONITOR trayMon = MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST);
-    HMONITOR fgMon = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
-    if (trayMon != fgMon) return false;
 
     MONITORINFO mi{};
     mi.cbSize = sizeof(mi);
@@ -278,15 +435,19 @@ void TaskbarWidget::RefreshData() {
 
 void TaskbarWidget::UpdateTheme() {
     palette_ = ui::MakePalette(ui::IsSystemDarkMode());
-    if (barVisible_) Render();
+    for (auto& bar : bars_) {
+        if (bar && bar->barVisible) {
+            RenderBar(*bar);
+        }
+    }
     panel_.UpdateTheme();
 }
 
-void TaskbarWidget::BuildSlots() {
-    slots_.clear();
-    auto sc = [this](int dip) { return ui::ScaleDpi(dip, dpi_); };
+void TaskbarWidget::BuildSlots(BarInstance& bar) {
+    bar.slots.clear();
+    auto sc = [&bar](int dip) { return ui::ScaleDpi(dip, bar.dpi); };
 
-    int barH = barRect_.bottom - barRect_.top;
+    int barH = bar.barRect.bottom - bar.barRect.top;
     int slotW = sc(34);
     int padX = sc(4);
     int maxW = sc(config_.Data().maxWidth);
@@ -298,7 +459,7 @@ void TaskbarWidget::BuildSlots() {
     Slot mSlot;
     mSlot.kind = SlotKind::Master;
     mSlot.rect = {x, 0, x + slotW, barH};
-    slots_.push_back(mSlot);
+    bar.slots.push_back(mSlot);
     x += slotW + sc(2);
 
     // Subtle divider space between Master and Apps
@@ -313,7 +474,7 @@ void TaskbarWidget::BuildSlots() {
             ov.kind = SlotKind::Overflow;
             ov.overflowCount = remaining;
             ov.rect = {x, 0, x + sc(28), barH};
-            slots_.push_back(ov);
+            bar.slots.push_back(ov);
             x += sc(28);
             break;
         }
@@ -321,81 +482,101 @@ void TaskbarWidget::BuildSlots() {
         s.kind = SlotKind::App;
         s.appIndex = i;
         s.rect = {x, 0, x + slotW, barH};
-        slots_.push_back(s);
+        bar.slots.push_back(s);
         x += slotW;
     }
 
     int finalW = (std::min)(maxW, x + padX);
-    barRect_.right = barRect_.left + finalW;
+    bar.barRect.right = bar.barRect.left + finalW;
 }
 
-void TaskbarWidget::UpdateLayoutAndPosition() {
-    if (!hwnd_) return;
+void TaskbarWidget::UpdateBarLayoutAndPosition(BarInstance& bar) {
+    if (!bar.hwnd) return;
+
+    bar.monitor = MonitorFromWindow(bar.trayHwnd, MONITOR_DEFAULTTONEAREST);
 
     RECT trayRc{};
     bool hidden = false;
-    if (!QueryTaskbarRect(&trayRc, &hidden) || hidden || IsFullscreenAppActive()) {
-        if (barVisible_) {
-            ShowWindow(hwnd_, SW_HIDE);
-            barVisible_ = false;
-            HideTooltip();
+    if (!QueryTaskbarRect(bar, &trayRc, &hidden) || hidden || IsFullscreenAppActive(bar.monitor)) {
+        if (bar.barVisible) {
+            ShowWindow(bar.hwnd, SW_HIDE);
+            bar.barVisible = false;
+            HideTooltip(bar);
         }
         return;
     }
 
-    HWND tray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (tray) {
-        UINT trayDpi = GetDpiForWindow(tray);
-        if (trayDpi != 0 && trayDpi != dpi_) {
-            dpi_ = trayDpi;
-            icons_.Clear();
-        }
+    UINT trayDpi = GetDpiForWindow(bar.trayHwnd);
+    if (trayDpi != 0) {
+        bar.dpi = trayDpi;
     }
 
-    int leftMargin = ui::ScaleDpi(8, dpi_);
-    barRect_.left = trayRc.left + leftMargin;
-    barRect_.top = trayRc.top;
-    barRect_.bottom = trayRc.bottom;
-    barRect_.right = barRect_.left + ui::ScaleDpi(config_.Data().maxWidth, dpi_);
+    int leftMargin = ui::ScaleDpi(8, bar.dpi);
+    bar.barRect.left = trayRc.left + leftMargin;
+    bar.barRect.top = trayRc.top;
+    bar.barRect.bottom = trayRc.bottom;
+    bar.barRect.right = bar.barRect.left + ui::ScaleDpi(config_.Data().maxWidth, bar.dpi);
 
-    BuildSlots();
+    BuildSlots(bar);
 
-    int w = barRect_.right - barRect_.left;
-    int h = barRect_.bottom - barRect_.top;
+    int w = bar.barRect.right - bar.barRect.left;
+    int h = bar.barRect.bottom - bar.barRect.top;
 
-    SetWindowPos(hwnd_, HWND_TOPMOST, barRect_.left, barRect_.top, w, h,
+    SetWindowPos(bar.hwnd, HWND_TOPMOST, bar.barRect.left, bar.barRect.top, w, h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    barVisible_ = true;
-    Render();
+    bar.barVisible = true;
+    RenderBar(bar);
+}
+
+void TaskbarWidget::UpdateLayoutAndPosition() {
+    if (!hwnd_) return;
+    SyncTaskbars();
+    for (auto& bar : bars_) {
+        if (bar) UpdateBarLayoutAndPosition(*bar);
+    }
 }
 
 void TaskbarWidget::CheckVisibilityAndZOrder() {
     if (!hwnd_) return;
 
-    RECT trayRc{};
-    bool hidden = false;
-    if (!QueryTaskbarRect(&trayRc, &hidden) || hidden || IsFullscreenAppActive()) {
-        if (barVisible_) {
-            ShowWindow(hwnd_, SW_HIDE);
-            barVisible_ = false;
-            HideTooltip();
+    bool needSync = false;
+    for (auto& bar : bars_) {
+        if (!bar || !bar->hwnd) continue;
+        if (!IsWindow(bar->trayHwnd)) {
+            needSync = true;
+            continue;
         }
-        return;
+
+        bar->monitor = MonitorFromWindow(bar->trayHwnd, MONITOR_DEFAULTTONEAREST);
+        RECT trayRc{};
+        bool hidden = false;
+        if (!QueryTaskbarRect(*bar, &trayRc, &hidden) || hidden || IsFullscreenAppActive(bar->monitor)) {
+            if (bar->barVisible) {
+                ShowWindow(bar->hwnd, SW_HIDE);
+                bar->barVisible = false;
+                HideTooltip(*bar);
+            }
+            continue;
+        }
+
+        if (!bar->barVisible) {
+            UpdateBarLayoutAndPosition(*bar);
+        } else {
+            SetWindowPos(bar->hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+        }
     }
 
-    if (!barVisible_) {
+    if (needSync) {
         UpdateLayoutAndPosition();
-    } else {
-        SetWindowPos(hwnd_, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
     }
 }
 
-void TaskbarWidget::Render() {
-    if (!hwnd_ || !barVisible_) return;
+void TaskbarWidget::RenderBar(BarInstance& bar) {
+    if (!bar.hwnd || !bar.barVisible) return;
 
-    int w = barRect_.right - barRect_.left;
-    int h = barRect_.bottom - barRect_.top;
+    int w = bar.barRect.right - bar.barRect.left;
+    int h = bar.barRect.bottom - bar.barRect.top;
     if (w <= 0 || h <= 0) return;
 
     HDC screenDc = GetDC(nullptr);
@@ -418,7 +599,7 @@ void TaskbarWidget::Render() {
     }
 
     HGDIOBJ oldBmp = SelectObject(memDc, dib);
-    auto sc = [this](int dip) { return ui::ScaleDpi(dip, dpi_); };
+    auto sc = [&bar](int dip) { return ui::ScaleDpi(dip, bar.dpi); };
 
     {
         Gdiplus::Graphics g(memDc);
@@ -436,12 +617,12 @@ void TaskbarWidget::Render() {
         if (iconTop < sc(4)) iconTop = sc(4);
         int barTop = iconTop + iconPx + sc(4);
 
-        for (size_t i = 0; i < slots_.size(); ++i) {
-            const Slot& s = slots_[i];
+        for (size_t i = 0; i < bar.slots.size(); ++i) {
+            const Slot& s = bar.slots[i];
             int sw = s.rect.right - s.rect.left;
 
             // Hover pill
-            if (static_cast<int>(i) == hoveredSlot_) {
+            if (static_cast<int>(i) == bar.hoveredSlot) {
                 Gdiplus::SolidBrush hoverBrush(palette_.hoverFill);
                 Gdiplus::RectF hr(static_cast<float>(s.rect.left + sc(1)),
                                   static_cast<float>(sc(4)),
@@ -501,7 +682,7 @@ void TaskbarWidget::Render() {
                                     static_cast<Gdiplus::REAL>(bmp->GetHeight()),
                                     Gdiplus::UnitPixel, &ia);
                     } else {
-                        // Discreet dimmed icon for paused/inactive apps (user preference)
+                        // Discreet dimmed icon for paused/inactive apps
                         Gdiplus::ColorMatrix cm = {{
                             {1, 0, 0, 0, 0},
                             {0, 1, 0, 0, 0},
@@ -553,14 +734,14 @@ void TaskbarWidget::Render() {
     }
 
     POINT ptSrc = {0, 0};
-    POINT ptDst = {barRect_.left, barRect_.top};
+    POINT ptDst = {bar.barRect.left, bar.barRect.top};
     SIZE sz = {w, h};
     BLENDFUNCTION bf{};
     bf.BlendOp = AC_SRC_OVER;
     bf.SourceConstantAlpha = 255;
     bf.AlphaFormat = AC_SRC_ALPHA;
 
-    UpdateLayeredWindow(hwnd_, screenDc, &ptDst, &sz, memDc, &ptSrc, 0, &bf, ULW_ALPHA);
+    UpdateLayeredWindow(bar.hwnd, screenDc, &ptDst, &sz, memDc, &ptSrc, 0, &bf, ULW_ALPHA);
 
     SelectObject(memDc, oldBmp);
     DeleteObject(dib);
@@ -568,9 +749,9 @@ void TaskbarWidget::Render() {
     ReleaseDC(nullptr, screenDc);
 }
 
-int TaskbarWidget::HitTestSlot(POINT pt) const {
-    for (size_t i = 0; i < slots_.size(); ++i) {
-        const RECT& r = slots_[i].rect;
+int TaskbarWidget::HitTestSlot(const BarInstance& bar, POINT pt) const {
+    for (size_t i = 0; i < bar.slots.size(); ++i) {
+        const RECT& r = bar.slots[i].rect;
         if (pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom) {
             return static_cast<int>(i);
         }
@@ -578,13 +759,13 @@ int TaskbarWidget::HitTestSlot(POINT pt) const {
     return -1;
 }
 
-void TaskbarWidget::ShowTooltipForSlot(int slotIdx, bool autoHideAfterScroll) {
-    if (slotIdx < 0 || slotIdx >= static_cast<int>(slots_.size())) {
-        HideTooltip();
+void TaskbarWidget::ShowTooltipForSlot(BarInstance& bar, int slotIdx, bool autoHideAfterScroll) {
+    if (slotIdx < 0 || slotIdx >= static_cast<int>(bar.slots.size())) {
+        HideTooltip(bar);
         return;
     }
 
-    const Slot& s = slots_[static_cast<size_t>(slotIdx)];
+    const Slot& s = bar.slots[static_cast<size_t>(slotIdx)];
     std::wstring text;
     if (s.kind == SlotKind::Master) {
         text = L"Mestre — " + std::to_wstring(ToPct(master_.volume)) + L"%";
@@ -598,27 +779,27 @@ void TaskbarWidget::ShowTooltipForSlot(int slotIdx, bool autoHideAfterScroll) {
         text = L"Abrir mixer (+" + std::to_wstring(s.overflowCount) + L" apps)";
     }
 
-    POINT anchor = {barRect_.left + (s.rect.left + s.rect.right) / 2, barRect_.top};
-    ShowTooltipText(text, anchor, autoHideAfterScroll);
+    POINT anchor = {bar.barRect.left + (s.rect.left + s.rect.right) / 2, bar.barRect.top};
+    ShowTooltipText(bar, text, anchor, autoHideAfterScroll);
 }
 
-void TaskbarWidget::ShowTooltipText(const std::wstring& text, POINT anchorScreenPt, bool autoHide) {
-    if (!tooltipHwnd_ || text.empty()) return;
-    RenderTooltip(text, anchorScreenPt);
-    if (autoHide) {
-        SetTimer(hwnd_, kTooltipHideTimerId, 1300, nullptr);
-    } else {
-        KillTimer(hwnd_, kTooltipHideTimerId);
+void TaskbarWidget::ShowTooltipText(BarInstance& bar, const std::wstring& text, POINT anchorScreenPt, bool autoHide) {
+    if (!bar.tooltipHwnd || text.empty()) return;
+    RenderTooltip(bar, text, anchorScreenPt);
+    if (autoHide && bar.hwnd) {
+        SetTimer(bar.hwnd, kTooltipHideTimerId, 1300, nullptr);
+    } else if (bar.hwnd) {
+        KillTimer(bar.hwnd, kTooltipHideTimerId);
     }
 }
 
-void TaskbarWidget::HideTooltip() {
-    if (hwnd_) KillTimer(hwnd_, kTooltipHideTimerId);
-    if (tooltipHwnd_) ShowWindow(tooltipHwnd_, SW_HIDE);
+void TaskbarWidget::HideTooltip(BarInstance& bar) {
+    if (bar.hwnd) KillTimer(bar.hwnd, kTooltipHideTimerId);
+    if (bar.tooltipHwnd) ShowWindow(bar.tooltipHwnd, SW_HIDE);
 }
 
-void TaskbarWidget::RenderTooltip(const std::wstring& text, POINT anchorScreenPt) {
-    auto sc = [this](int dip) { return ui::ScaleDpi(dip, dpi_); };
+void TaskbarWidget::RenderTooltip(BarInstance& bar, const std::wstring& text, POINT anchorScreenPt) {
+    auto sc = [&bar](int dip) { return ui::ScaleDpi(dip, bar.dpi); };
 
     HDC screenDc = GetDC(nullptr);
     Gdiplus::FontFamily ff(L"Segoe UI");
@@ -646,7 +827,7 @@ void TaskbarWidget::RenderTooltip(const std::wstring& text, POINT anchorScreenPt
     int y = anchorScreenPt.y - h - sc(8);
     if (x < mi.rcMonitor.left + sc(4)) x = mi.rcMonitor.left + sc(4);
     if (x + w > mi.rcMonitor.right - sc(4)) x = mi.rcMonitor.right - w - sc(4);
-    if (y < mi.rcMonitor.top + sc(4)) y = barRect_.bottom + sc(8);
+    if (y < mi.rcMonitor.top + sc(4)) y = bar.barRect.bottom + sc(8);
 
     HDC memDc = CreateCompatibleDC(screenDc);
     BITMAPINFO bi{};
@@ -689,8 +870,8 @@ void TaskbarWidget::RenderTooltip(const std::wstring& text, POINT anchorScreenPt
         bf.SourceConstantAlpha = 255;
         bf.AlphaFormat = AC_SRC_ALPHA;
 
-        SetWindowPos(tooltipHwnd_, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        UpdateLayeredWindow(tooltipHwnd_, screenDc, &ptDst, &sz, memDc, &ptSrc, 0, &bf, ULW_ALPHA);
+        SetWindowPos(bar.tooltipHwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        UpdateLayeredWindow(bar.tooltipHwnd, screenDc, &ptDst, &sz, memDc, &ptSrc, 0, &bf, ULW_ALPHA);
 
         SelectObject(memDc, oldBmp);
         DeleteObject(dib);
@@ -723,6 +904,18 @@ LRESULT CALLBACK TaskbarWidget::WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         self->hwnd_ = hwnd;
     }
     if (self) return self->HandleMessage(msg, wParam, lParam);
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+LRESULT CALLBACK TaskbarWidget::BarWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* bar = reinterpret_cast<BarInstance*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_NCCREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        bar = static_cast<BarInstance*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(bar));
+        bar->hwnd = hwnd;
+    }
+    if (bar && bar->owner) return bar->owner->HandleBarMessage(*bar, msg, wParam, lParam);
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
@@ -771,10 +964,6 @@ LRESULT TaskbarWidget::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                 panel_.RefreshData();
                 return 0;
             }
-            if (wParam == kTooltipHideTimerId) {
-                HideTooltip();
-                return 0;
-            }
             break;
 
         case WM_HOTKEY: {
@@ -790,118 +979,27 @@ LRESULT TaskbarWidget::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
                     config_.ApplyProfile(profName, engine_);
                     RefreshData();
                     panel_.RefreshData();
-                    POINT anchor = {barRect_.left + (barRect_.right - barRect_.left) / 2, barRect_.top};
-                    ShowTooltipText(L"Perfil: " + profName, anchor, true);
+
+                    BarInstance* targetBar = nullptr;
+                    POINT cursor{};
+                    if (GetCursorPos(&cursor)) {
+                        targetBar = FindBarForMonitor(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST));
+                    }
+                    if (!targetBar && !bars_.empty()) {
+                        targetBar = bars_.front().get();
+                    }
+                    if (targetBar && targetBar->barVisible) {
+                        POINT anchor = {
+                            targetBar->barRect.left + (targetBar->barRect.right - targetBar->barRect.left) / 2,
+                            targetBar->barRect.top
+                        };
+                        ShowTooltipText(*targetBar, L"Perfil: " + profName, anchor, true);
+                    }
                 }
                 return 0;
             }
             break;
         }
-
-        case WM_MOUSEMOVE: {
-            if (!trackingMouse_) {
-                TRACKMOUSEEVENT tme{};
-                tme.cbSize = sizeof(tme);
-                tme.dwFlags = TME_LEAVE;
-                tme.hwndTrack = hwnd_;
-                TrackMouseEvent(&tme);
-                trackingMouse_ = true;
-            }
-            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            int idx = HitTestSlot(pt);
-            if (idx != hoveredSlot_) {
-                hoveredSlot_ = idx;
-                Render();
-                if (idx >= 0) ShowTooltipForSlot(idx, false);
-                else HideTooltip();
-            }
-            return 0;
-        }
-
-        case WM_MOUSELEAVE:
-            trackingMouse_ = false;
-            if (hoveredSlot_ != -1) {
-                hoveredSlot_ = -1;
-                Render();
-            }
-            HideTooltip();
-            return 0;
-
-        case WM_MOUSEWHEEL: {
-            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            ScreenToClient(hwnd_, &pt);
-            int idx = HitTestSlot(pt);
-            if (idx < 0) return 0;
-
-            int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-            bool shift = (GET_KEYSTATE_WPARAM(wParam) & MK_SHIFT) != 0;
-            float step = static_cast<float>(shift ? 10 : config_.Data().scrollStep) / 100.0f;
-            float dir = (delta > 0) ? 1.0f : -1.0f;
-
-            const Slot& s = slots_[static_cast<size_t>(idx)];
-            if (s.kind == SlotKind::Master) {
-                engine_.SetMasterVolume(master_.volume + dir * step);
-            } else if (s.kind == SlotKind::App && s.appIndex >= 0 && s.appIndex < static_cast<int>(apps_.size())) {
-                const AppAudioInfo& app = apps_[static_cast<size_t>(s.appIndex)];
-                engine_.SetAppVolume(app.appId, app.volume + dir * step);
-            } else {
-                return 0;
-            }
-
-            master_ = engine_.GetMasterInfo();
-            apps_ = engine_.GetApps();
-            Render();
-            panel_.RefreshData();
-            ShowTooltipForSlot(idx, true);
-            return 0;
-        }
-
-        case WM_LBUTTONUP: {
-            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            int idx = HitTestSlot(pt);
-            if (idx < 0) return 0;
-
-            const Slot& s = slots_[static_cast<size_t>(idx)];
-            if (s.kind == SlotKind::Master || s.kind == SlotKind::Overflow) {
-                HideTooltip();
-                panel_.Toggle(GetAnchorRect());
-            } else if (s.kind == SlotKind::App && s.appIndex >= 0 && s.appIndex < static_cast<int>(apps_.size())) {
-                const AppAudioInfo& app = apps_[static_cast<size_t>(s.appIndex)];
-                engine_.ToggleAppMute(app.appId);
-                master_ = engine_.GetMasterInfo();
-                apps_ = engine_.GetApps();
-                Render();
-                panel_.RefreshData();
-                ShowTooltipForSlot(idx, true);
-            }
-            return 0;
-        }
-
-        case WM_RBUTTONUP: {
-            HideTooltip();
-            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            int idx = HitTestSlot(pt);
-            POINT scr = pt;
-            ClientToScreen(hwnd_, &scr);
-
-            auto cb = MakeMenuCallbacks();
-            if (idx >= 0 && slots_[static_cast<size_t>(idx)].kind == SlotKind::App) {
-                int ai = slots_[static_cast<size_t>(idx)].appIndex;
-                if (ai >= 0 && ai < static_cast<int>(apps_.size())) {
-                    ui::ShowAppMenu(hwnd_, scr, apps_[static_cast<size_t>(ai)], engine_, config_, cb);
-                    return 0;
-                }
-            }
-            ui::ShowGeneralMenu(hwnd_, scr, engine_, config_, cb);
-            return 0;
-        }
-
-        case WM_DPICHANGED:
-            dpi_ = HIWORD(wParam);
-            if (dpi_ == 0) dpi_ = 96;
-            icons_.Clear();
-            UpdateLayoutAndPosition();
-            return 0;
 
         case WM_DISPLAYCHANGE:
             UpdateLayoutAndPosition();
@@ -918,4 +1016,137 @@ LRESULT TaskbarWidget::HandleMessage(UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     return DefWindowProcW(hwnd_, msg, wParam, lParam);
+}
+
+LRESULT TaskbarWidget::HandleBarMessage(BarInstance& bar, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+        case WM_TIMER:
+            if (wParam == kTooltipHideTimerId) {
+                HideTooltip(bar);
+                return 0;
+            }
+            break;
+
+        case WM_MOUSEMOVE: {
+            if (!bar.trackingMouse) {
+                TRACKMOUSEEVENT tme{};
+                tme.cbSize = sizeof(tme);
+                tme.dwFlags = TME_LEAVE;
+                tme.hwndTrack = bar.hwnd;
+                TrackMouseEvent(&tme);
+                bar.trackingMouse = true;
+            }
+            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            int idx = HitTestSlot(bar, pt);
+            if (idx != bar.hoveredSlot) {
+                bar.hoveredSlot = idx;
+                RenderBar(bar);
+                if (idx >= 0) ShowTooltipForSlot(bar, idx, false);
+                else HideTooltip(bar);
+            }
+            return 0;
+        }
+
+        case WM_MOUSELEAVE:
+            bar.trackingMouse = false;
+            if (bar.hoveredSlot != -1) {
+                bar.hoveredSlot = -1;
+                RenderBar(bar);
+            }
+            HideTooltip(bar);
+            return 0;
+
+        case WM_MOUSEWHEEL: {
+            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            ScreenToClient(bar.hwnd, &pt);
+            int idx = HitTestSlot(bar, pt);
+            if (idx < 0) return 0;
+
+            int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+            bool shift = (GET_KEYSTATE_WPARAM(wParam) & MK_SHIFT) != 0;
+            float step = static_cast<float>(shift ? 10 : config_.Data().scrollStep) / 100.0f;
+            float dir = (delta > 0) ? 1.0f : -1.0f;
+
+            const Slot& s = bar.slots[static_cast<size_t>(idx)];
+            if (s.kind == SlotKind::Master) {
+                engine_.SetMasterVolume(master_.volume + dir * step);
+            } else if (s.kind == SlotKind::App && s.appIndex >= 0 && s.appIndex < static_cast<int>(apps_.size())) {
+                const AppAudioInfo& app = apps_[static_cast<size_t>(s.appIndex)];
+                engine_.SetAppVolume(app.appId, app.volume + dir * step);
+            } else {
+                return 0;
+            }
+
+            master_ = engine_.GetMasterInfo();
+            apps_ = engine_.GetApps();
+            for (auto& b : bars_) {
+                if (b && b->barVisible) RenderBar(*b);
+            }
+            panel_.RefreshData();
+            ShowTooltipForSlot(bar, idx, true);
+            return 0;
+        }
+
+        case WM_LBUTTONUP: {
+            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            int idx = HitTestSlot(bar, pt);
+            if (idx < 0) return 0;
+
+            const Slot& s = bar.slots[static_cast<size_t>(idx)];
+            if (s.kind == SlotKind::Master || s.kind == SlotKind::Overflow) {
+                HideTooltip(bar);
+                panel_.Toggle(GetAnchorRectForBar(bar));
+            } else if (s.kind == SlotKind::App && s.appIndex >= 0 && s.appIndex < static_cast<int>(apps_.size())) {
+                const AppAudioInfo& app = apps_[static_cast<size_t>(s.appIndex)];
+                engine_.ToggleAppMute(app.appId);
+                master_ = engine_.GetMasterInfo();
+                apps_ = engine_.GetApps();
+                for (auto& b : bars_) {
+                    if (b && b->barVisible) RenderBar(*b);
+                }
+                panel_.RefreshData();
+                ShowTooltipForSlot(bar, idx, true);
+            }
+            return 0;
+        }
+
+        case WM_RBUTTONUP: {
+            HideTooltip(bar);
+            POINT pt = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+            int idx = HitTestSlot(bar, pt);
+            POINT scr = pt;
+            ClientToScreen(bar.hwnd, &scr);
+
+            auto cb = MakeMenuCallbacks();
+            cb.onOpenPanel = [this, &bar]() {
+                panel_.Toggle(GetAnchorRectForBar(bar));
+            };
+            if (idx >= 0 && bar.slots[static_cast<size_t>(idx)].kind == SlotKind::App) {
+                int ai = bar.slots[static_cast<size_t>(idx)].appIndex;
+                if (ai >= 0 && ai < static_cast<int>(apps_.size())) {
+                    ui::ShowAppMenu(bar.hwnd, scr, apps_[static_cast<size_t>(ai)], engine_, config_, cb);
+                    return 0;
+                }
+            }
+            ui::ShowGeneralMenu(bar.hwnd, scr, engine_, config_, cb);
+            return 0;
+        }
+
+        case WM_DPICHANGED:
+            bar.dpi = HIWORD(wParam);
+            if (bar.dpi == 0) bar.dpi = 96;
+            UpdateBarLayoutAndPosition(bar);
+            return 0;
+
+        case WM_DISPLAYCHANGE:
+            UpdateLayoutAndPosition();
+            return 0;
+
+        case WM_SETTINGCHANGE:
+            UpdateTheme();
+            UpdateLayoutAndPosition();
+            return 0;
+    }
+
+    return DefWindowProcW(bar.hwnd, msg, wParam, lParam);
 }

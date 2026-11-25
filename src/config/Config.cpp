@@ -364,6 +364,11 @@ bool ConfigManager::ParseJson(const std::string& utf8) {
         cfg_.scrollStep = (std::max)(1, (std::min)(25, s));
     }
 
+    auto itMulti = root.objVal.find("showOnAllMonitors");
+    if (itMulti != root.objVal.end() && itMulti->second.type == JsonValue::Bool) {
+        cfg_.showOnAllMonitors = itMulti->second.boolVal;
+    }
+
     auto itHk = root.objVal.find("hotkeys");
     if (itHk != root.objVal.end() && itHk->second.type == JsonValue::Object) {
         auto itOpen = itHk->second.objVal.find("openPanel");
@@ -402,6 +407,7 @@ std::string ConfigManager::SerializeJson() const {
     out += "{\n";
     out += "  \"maxWidth\": " + std::to_string(cfg_.maxWidth) + ",\n";
     out += "  \"scrollStep\": " + std::to_string(cfg_.scrollStep) + ",\n";
+    out += "  \"showOnAllMonitors\": " + std::string(cfg_.showOnAllMonitors ? "true" : "false") + ",\n";
     out += "  \"hotkeys\": { \"openPanel\": " + EscapeJsonString(util::WideToUtf8(cfg_.openPanelHotkey)) + " },\n";
     out += "  \"profiles\": {\n";
 
